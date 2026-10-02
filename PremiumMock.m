@@ -693,9 +693,19 @@ static void hookStoreKit(void) {
 // ═══════════════════════════════════════════════════════════════
 
 static void image_added(const struct mach_header *mh, intptr_t vmaddr_slide) {
-    // When a new binary/framework is loaded, check if we need to re-apply hooks
-    // This catches lazy-loaded Swift libraries or views.
-    dispatch_async(dispatch_get_main_queue(), ^{
+    // Throttle the calls because at app launch, this is called ~500 times synchronously.
+    // Overloading the main queue with 500 hookKnownTargets() calls causes the app to spin indefinitely.
+    static BOOL isThrottled = NO;
+    
+    @synchronized ([PremiumMockLoader class]) {
+        if (isThrottled) return;
+        isThrottled = YES;
+    }
+    
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        @synchronized ([PremiumMockLoader class]) {
+            isThrottled = NO;
+        }
         hookKnownTargets();
     });
 }
@@ -712,7 +722,7 @@ static void installDyldMonitor(void) {
 @implementation PremiumMockLoader
 
 + (void)activate {
-    PMLOG(@"🚀 PremiumMock v3.0 activating...");
+    PMLOG(@"🚀 PremiumMock v3.0.1 activating...");
 
     // Layer 1: Property hooks (ObjC getter/setter swizzle)
     hookKnownTargets();
@@ -742,7 +752,7 @@ static void installDyldMonitor(void) {
     // Layer 9: Dyld monitor
     installDyldMonitor();
 
-    PMLOG(@"✅ PremiumMock v3.0 active!");
+    PMLOG(@"✅ PremiumMock v3.0.1 active!");
     PMLOG(@"  Layer 1: Property hooks ✅");
     PMLOG(@"  Layer 2: UserDefaults ✅");
     PMLOG(@"  Layer 3: JSON patch ✅");
@@ -782,7 +792,7 @@ __attribute__((constructor))
 static void premiumMockInit(void) {
     @autoreleasepool {
         PMLOG(@"═══════════════════════════════════════════");
-        PMLOG(@"  AppRaven PremiumMock v3.0 — QA Testing   ");
+        PMLOG(@"  AppRaven PremiumMock v3.0.1 — QA Testing   ");
         PMLOG(@"═══════════════════════════════════════════");
 
         // Activate after Swift metadata loaded
