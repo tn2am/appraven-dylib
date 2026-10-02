@@ -2,26 +2,16 @@
 //  PremiumMock.m
 //  AppRavenPremiumMock
 //
-//  Core runtime hooking logic for QA testing.
-//  Uses the Objective-C runtime to swizzle property getters
-//  on Swift classes exposed to ObjC.
+//  v2.2 — Fix premium disappearing:
+//  Root cause: SwiftUI reads from Combine @Published internal storage,
+//  bypassing ObjC hooked getters. Server GraphQL returns premium:false,
+//  Apollo writes to @Published → Combine emits false → UI updates.
 //
-//  v2.1 — Crash-safe version:
-//  • Removed _dyld_register_func_for_add_image (causes deadlock)
-//  • Targeted JSON patching (only AppRaven data, not global)
-//  • Safe KVO with recursion guard
-//  • Periodic timer for re-enforcement (safe approach)
-//
-//  Binary analysis findings (AppRaven 2.2.11, build 2):
-//  ─────────────────────────────────────────────────────
-//  • PremiumVM  (_TtC8AppRaven9PremiumVM)  — ViewModel managing premium state
-//  • User model has: premium (Bool), hasAppleIdPremium (Bool)
-//  • Content models have: premiumOnly (Bool)
-//  • UI flags: _showsPremiumV, _showsPremiumAlert,
-//              _showsPremiumOnlyInfoAlert, _showPremiumV
-//  • Subscription tiers: premiumMonthly, premiumYearly, premiumOnce
-//  • GraphQL: MyUserData fragment includes `premium` field
-//  • Apollo GraphQL client stores user data in normalized cache
+//  Solution: Patch at MULTIPLE layers:
+//  1. NSJSONSerialization — patch ALL JSON containing "premium" (raw byte pre-check)
+//  2. NSURLProtocol — intercept HTTP responses before any framework sees them
+//  3. Property hooks — safety net for ObjC-level access
+//  4. Periodic re-enforcement + lifecycle hooks
 //
 
 #import "PremiumMock.h"
@@ -37,93 +27,62 @@ static void hookKnownTargets(void);
 static void hookUserDefaults(void);
 
 // ═══════════════════════════════════════════════════════════════
-#pragma mark - Replacement IMPs (Implementations)
+#pragma mark - Replacement IMPs
 // ═══════════════════════════════════════════════════════════════
 
-// Returns YES — used to override premium/hasAppleIdPremium getters
-static BOOL hook_returnYES(id self, SEL _cmd) {
-    return YES;
-}
-
-// Returns NO — used to override premiumOnly and showsPremiumV getters
-static BOOL hook_returnNO(id self, SEL _cmd) {
-    return NO;
-}
-
-// No-op setter — swallows any attempt to set premium = false
-static void hook_setterNoop(id self, SEL _cmd, BOOL value) {
-    // Ignore value; premium stays true
-}
+static BOOL hook_returnYES(id self, SEL _cmd) { return YES; }
+static BOOL hook_returnNO(id self, SEL _cmd) { return NO; }
+static void hook_setterNoop(id self, SEL _cmd, BOOL value) { /* swallow */ }
 
 // ═══════════════════════════════════════════════════════════════
 #pragma mark - Swizzle Helpers
 // ═══════════════════════════════════════════════════════════════
 
-/// Swizzle an instance method on a class. If the method doesn't exist,
-/// add it with the replacement IMP instead.
 static BOOL swizzleMethod(Class cls, SEL sel, IMP newIMP, const char *types) {
     if (!cls) return NO;
-
     Method method = class_getInstanceMethod(cls, sel);
     if (method) {
         method_setImplementation(method, newIMP);
         return YES;
     } else {
-        // Method doesn't exist — add it dynamically
         return class_addMethod(cls, sel, newIMP, types);
     }
 }
 
-/// Try to swizzle a getter (returns BOOL) on a class by name.
 static void hookBoolGetter(const char *className, const char *selName, BOOL returnValue) {
     Class cls = objc_getClass(className);
     if (!cls) return;
-
     SEL sel = sel_registerName(selName);
     IMP imp = returnValue ? (IMP)hook_returnYES : (IMP)hook_returnNO;
-    if (swizzleMethod(cls, sel, imp, "B@:")) {
-        PMLOG(@"✅ Hooked %s.%s -> %s", className, selName, returnValue ? "true" : "false");
-    }
+    swizzleMethod(cls, sel, imp, "B@:");
 }
 
-/// Try to swizzle a setter (void, takes BOOL) to no-op.
 static void hookBoolSetter(const char *className, const char *selName) {
     Class cls = objc_getClass(className);
     if (!cls) return;
-
     SEL sel = sel_registerName(selName);
-    if (swizzleMethod(cls, sel, (IMP)hook_setterNoop, "v@:B")) {
-        PMLOG(@"✅ Hooked setter %s.%s -> noop", className, selName);
-    }
+    swizzleMethod(cls, sel, (IMP)hook_setterNoop, "v@:B");
 }
 
 // ═══════════════════════════════════════════════════════════════
-#pragma mark - Hook a Single AppRaven Class (All Premium Props)
+#pragma mark - Hook All Premium Props on a Class
 // ═══════════════════════════════════════════════════════════════
 
-/// Hooks all premium-related properties on a single class.
-/// Can be called repeatedly (idempotent — re-sets IMP each time).
 static void hookPremiumPropsOnClass(Class cls) {
     if (!cls) return;
     const char *name = class_getName(cls);
-    if (!name) return;
+    if (!name || strncmp(name, "_TtC8AppRaven", 13) != 0) return;
 
-    // Only process AppRaven classes (Swift mangled: _TtC8AppRaven...)
-    if (strncmp(name, "_TtC8AppRaven", 13) != 0) return;
-
-    // Properties to force YES (only if property actually exists on class)
     const char *yesProps[] = {
         SEL_PREMIUM, SEL_IS_PREMIUM, SEL_HAS_APPLE_PREMIUM,
         SEL_IS_SUBSCRIBED, SEL_HAS_ACTIVE_SUB, SEL_SUBSCRIPTION_ACTIVE,
         SEL_IS_PRO, SEL_PRO, NULL
     };
-    // Properties to force NO
     const char *noProps[] = {
         SEL_PREMIUM_ONLY, SEL_SHOWS_PREMIUM_V, SEL_SHOW_PREMIUM_V,
         SEL_SHOWS_PREMIUM_ALERT, SEL_SHOWS_PREMIUM_ONLY_INFO,
         SEL_SHOW_PAYWALL, SEL_SHOULD_SHOW_PAYWALL, SEL_SHOWS_SUBSCRIPTION_V, NULL
     };
-    // Setters to block (noop)
     const char *blockedSetters[] = {
         "setPremium:", "setIsPremium:", "setHasAppleIdPremium:",
         "setShowsPremiumV:", "setShowPremiumV:", "setShowsPremiumAlert:",
@@ -135,208 +94,208 @@ static void hookPremiumPropsOnClass(Class cls) {
 
     for (int i = 0; yesProps[i]; i++) {
         if (class_getProperty(cls, yesProps[i]) ||
-            class_getInstanceMethod(cls, sel_registerName(yesProps[i]))) {
+            class_getInstanceMethod(cls, sel_registerName(yesProps[i])))
             hookBoolGetter(name, yesProps[i], YES);
-        }
     }
-
     for (int i = 0; noProps[i]; i++) {
         if (class_getProperty(cls, noProps[i]) ||
-            class_getInstanceMethod(cls, sel_registerName(noProps[i]))) {
+            class_getInstanceMethod(cls, sel_registerName(noProps[i])))
             hookBoolGetter(name, noProps[i], NO);
-        }
     }
-
     for (int i = 0; blockedSetters[i]; i++) {
-        SEL setSel = sel_registerName(blockedSetters[i]);
-        if (class_getInstanceMethod(cls, setSel)) {
+        if (class_getInstanceMethod(cls, sel_registerName(blockedSetters[i])))
             hookBoolSetter(name, blockedSetters[i]);
-        }
     }
 }
 
 // ═══════════════════════════════════════════════════════════════
-#pragma mark - KVO / @Published Observation Hook (Safe)
+#pragma mark - KVO Watcher (with recursion guard)
 // ═══════════════════════════════════════════════════════════════
 
-/// KVO watcher with recursion guard to prevent infinite loop.
 @interface PremiumKVOWatcher : NSObject
 @property (nonatomic, strong) id target;
 @property (nonatomic, copy) NSString *keyPath;
 @property (nonatomic, assign) BOOL desiredValue;
-@property (nonatomic, assign) BOOL isUpdating; // recursion guard
+@property (nonatomic, assign) BOOL isUpdating;
 @end
 
 @implementation PremiumKVOWatcher
-
 - (instancetype)initWithTarget:(id)target keyPath:(NSString *)keyPath desiredValue:(BOOL)desired {
     self = [super init];
     if (self) {
-        _target = target;
-        _keyPath = keyPath;
-        _desiredValue = desired;
-        _isUpdating = NO;
+        _target = target; _keyPath = keyPath; _desiredValue = desired; _isUpdating = NO;
         @try {
-            [target addObserver:self
-                     forKeyPath:keyPath
-                        options:NSKeyValueObservingOptionNew
-                        context:NULL];
-            PMLOG(@"✅ KVO observer on %@.%@", NSStringFromClass([target class]), keyPath);
-        } @catch (NSException *e) {
-            PMLOG(@"⚠️  KVO failed for %@: %@", keyPath, e.reason);
-        }
+            [target addObserver:self forKeyPath:keyPath
+                        options:NSKeyValueObservingOptionNew context:NULL];
+        } @catch (NSException *e) {}
     }
     return self;
 }
-
-- (void)observeValueForKeyPath:(NSString *)keyPath
-                      ofObject:(id)object
-                        change:(NSDictionary *)change
-                       context:(void *)context {
-    // Recursion guard — prevent infinite loop
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object
+                        change:(NSDictionary *)change context:(void *)context {
     if (self.isUpdating) return;
-
     NSNumber *newVal = change[NSKeyValueChangeNewKey];
     if (!newVal || ![newVal isKindOfClass:[NSNumber class]]) return;
-
-    BOOL current = [newVal boolValue];
-    if (current != self.desiredValue) {
+    if ([newVal boolValue] != self.desiredValue) {
         self.isUpdating = YES;
-        @try {
-            [object setValue:@(self.desiredValue) forKey:keyPath];
-        } @catch (NSException *e) {
-            // Fallback: the hooked getter already returns the right value
-        }
+        @try { [object setValue:@(self.desiredValue) forKey:keyPath]; } @catch (NSException *e) {}
         self.isUpdating = NO;
     }
 }
-
 - (void)dealloc {
-    @try {
-        [_target removeObserver:self forKeyPath:_keyPath];
-    } @catch (NSException *e) {}
+    @try { [_target removeObserver:self forKeyPath:_keyPath]; } @catch (NSException *e) {}
 }
-
 @end
 
-// Store observers to keep them alive
 static NSMutableArray *g_observers = nil;
 
-/// Install KVO watchers on singleton/shared instances.
 static void installKVOWatchers(void) {
-    if (!g_observers) {
-        g_observers = [NSMutableArray new];
-    }
-
-    NSArray *singletonSelectors = @[@"shared", @"sharedInstance", @"current"];
-
-    const char *targetClasses[] = {
-        APPRAVEN_PREMIUM_VM, APPRAVEN_HOME_VM, APPRAVEN_MAIN_TVM,
-        APPRAVEN_ACCOUNT_VM, NULL
-    };
-
-    for (int i = 0; targetClasses[i]; i++) {
-        Class cls = objc_getClass(targetClasses[i]);
+    if (!g_observers) g_observers = [NSMutableArray new];
+    NSArray *selNames = @[@"shared", @"sharedInstance", @"current"];
+    const char *targets[] = { APPRAVEN_PREMIUM_VM, APPRAVEN_HOME_VM, APPRAVEN_MAIN_TVM,
+                              APPRAVEN_ACCOUNT_VM, NULL };
+    for (int i = 0; targets[i]; i++) {
+        Class cls = objc_getClass(targets[i]);
         if (!cls) continue;
-
-        for (NSString *selStr in singletonSelectors) {
-            SEL sel = NSSelectorFromString(selStr);
-            if ([cls respondsToSelector:sel]) {
-                @try {
-                    id instance = ((id(*)(id, SEL))objc_msgSend)((id)cls, sel);
-                    if (instance) {
-                        // Only add watchers for properties that actually exist
-                        if (class_getProperty([instance class], "premium")) {
-                            PremiumKVOWatcher *w = [[PremiumKVOWatcher alloc]
-                                initWithTarget:instance keyPath:@"premium" desiredValue:YES];
-                            [g_observers addObject:w];
-                        }
-                        if (class_getProperty([instance class], "hasAppleIdPremium")) {
-                            PremiumKVOWatcher *w = [[PremiumKVOWatcher alloc]
-                                initWithTarget:instance keyPath:@"hasAppleIdPremium" desiredValue:YES];
-                            [g_observers addObject:w];
-                        }
+        for (NSString *s in selNames) {
+            SEL sel = NSSelectorFromString(s);
+            if (![cls respondsToSelector:sel]) continue;
+            @try {
+                id inst = ((id(*)(id, SEL))objc_msgSend)((id)cls, sel);
+                if (!inst) continue;
+                NSArray *keys = @[@"premium", @"hasAppleIdPremium", @"isPremium"];
+                for (NSString *k in keys) {
+                    if (class_getProperty([inst class], [k UTF8String])) {
+                        PremiumKVOWatcher *w = [[PremiumKVOWatcher alloc]
+                            initWithTarget:inst keyPath:k desiredValue:YES];
+                        [g_observers addObject:w];
                     }
-                } @catch (NSException *e) {}
-            }
+                }
+            } @catch (NSException *e) {}
         }
     }
 }
 
 // ═══════════════════════════════════════════════════════════════
-#pragma mark - Targeted JSON Response Patching
+#pragma mark - JSON Response Patching (THE KEY FIX)
 // ═══════════════════════════════════════════════════════════════
 
-/// Recursively patch premium fields in a JSON object.
-static id patchPremiumInJSON(id obj) {
+/// Check if raw data contains "premium" substring (fast byte scan).
+/// Only if true do we bother patching the parsed JSON.
+static BOOL dataContainsPremiumKey(NSData *data) {
+    if (!data || data.length < 9) return NO; // "premium" = 7 chars + quotes
+    const char *bytes = (const char *)data.bytes;
+    NSUInteger len = data.length;
+    // Search for "premium" (with quotes, as in JSON)
+    const char needle[] = "\"premium\"";
+    const size_t needleLen = 9;
+    if (len < needleLen) return NO;
+    for (NSUInteger i = 0; i <= len - needleLen; i++) {
+        if (bytes[i] == '"' && memcmp(bytes + i, needle, needleLen) == 0) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+/// Recursively patch premium fields. Returns a NEW (immutable) copy
+/// if modifications were made, or the original object if not.
+static id patchPremiumInJSON(id obj, BOOL *didPatch) {
     if ([obj isKindOfClass:[NSDictionary class]]) {
-        NSMutableDictionary *mutable = [obj mutableCopy];
-        for (NSString *key in [mutable allKeys]) {
+        NSDictionary *dict = obj;
+        NSMutableDictionary *mutable = nil;
+
+        for (NSString *key in dict) {
+            id val = dict[key];
+            BOOL patchThis = NO;
+            id newVal = val;
+
+            // Premium-related keys → force YES
             if ([key isEqualToString:@"premium"] ||
                 [key isEqualToString:@"isPremium"] ||
-                [key isEqualToString:@"hasAppleIdPremium"]) {
-                mutable[key] = @YES;
-            } else if ([key isEqualToString:@"premiumOnly"]) {
-                mutable[key] = @NO;
-            } else {
-                id val = mutable[key];
-                if ([val isKindOfClass:[NSDictionary class]] ||
-                    [val isKindOfClass:[NSArray class]]) {
-                    mutable[key] = patchPremiumInJSON(val);
+                [key isEqualToString:@"hasAppleIdPremium"] ||
+                [key isEqualToString:@"isSubscribed"] ||
+                [key isEqualToString:@"hasActiveSubscription"]) {
+                if ([val isKindOfClass:[NSNumber class]] && ![val boolValue]) {
+                    newVal = @YES;
+                    patchThis = YES;
+                } else if (val == [NSNull null] || val == nil) {
+                    newVal = @YES;
+                    patchThis = YES;
+                }
+            }
+            // premiumOnly → force NO
+            else if ([key isEqualToString:@"premiumOnly"]) {
+                if ([val isKindOfClass:[NSNumber class]] && [val boolValue]) {
+                    newVal = @NO;
+                    patchThis = YES;
+                }
+            }
+            // Recurse into nested structures
+            else if ([val isKindOfClass:[NSDictionary class]] ||
+                     [val isKindOfClass:[NSArray class]]) {
+                BOOL childPatched = NO;
+                newVal = patchPremiumInJSON(val, &childPatched);
+                patchThis = childPatched;
+            }
+
+            if (patchThis) {
+                if (!mutable) mutable = [dict mutableCopy];
+                mutable[key] = newVal;
+                *didPatch = YES;
+            }
+        }
+
+        return mutable ? [mutable copy] : obj; // return immutable copy
+    }
+    else if ([obj isKindOfClass:[NSArray class]]) {
+        NSArray *arr = obj;
+        NSMutableArray *mutable = nil;
+
+        for (NSUInteger i = 0; i < arr.count; i++) {
+            id val = arr[i];
+            if ([val isKindOfClass:[NSDictionary class]] ||
+                [val isKindOfClass:[NSArray class]]) {
+                BOOL childPatched = NO;
+                id newVal = patchPremiumInJSON(val, &childPatched);
+                if (childPatched) {
+                    if (!mutable) mutable = [arr mutableCopy];
+                    mutable[i] = newVal;
+                    *didPatch = YES;
                 }
             }
         }
-        return mutable;
-    } else if ([obj isKindOfClass:[NSArray class]]) {
-        NSMutableArray *mutable = [obj mutableCopy];
-        for (NSUInteger i = 0; i < mutable.count; i++) {
-            id val = mutable[i];
-            if ([val isKindOfClass:[NSDictionary class]] ||
-                [val isKindOfClass:[NSArray class]]) {
-                mutable[i] = patchPremiumInJSON(val);
-            }
-        }
-        return mutable;
+
+        return mutable ? [mutable copy] : obj;
     }
     return obj;
 }
 
-/// Check if JSON data looks like an AppRaven GraphQL response
-/// by looking for "data" key with nested user/premium fields.
-static BOOL isAppRavenGraphQLResponse(id obj) {
-    if (![obj isKindOfClass:[NSDictionary class]]) return NO;
-    NSDictionary *dict = obj;
-
-    // GraphQL responses have a "data" key
-    if (dict[@"data"]) return YES;
-
-    // Or direct user data with premium field
-    if (dict[@"premium"] || dict[@"hasAppleIdPremium"] ||
-        dict[@"isPremium"] || dict[@"MyUserData"]) return YES;
-
-    return NO;
-}
-
-// Original IMP storage for NSJSONSerialization
+// Original IMP storage
 static id (*orig_JSONObjectWithData)(id, SEL, NSData*, NSJSONReadingOptions, NSError**) = NULL;
 
-/// Swizzled JSONObjectWithData — ONLY patches AppRaven GraphQL responses
+/// Hooked NSJSONSerialization — patches premium fields in JSON that contains "premium" key.
+/// Uses raw byte pre-check to skip non-AppRaven JSON entirely (zero overhead for ads/other SDKs).
 static id hook_JSONObjectWithData(id self, SEL _cmd, NSData *data, NSJSONReadingOptions opt, NSError **error) {
+    // Fast path: call original first
     id result = orig_JSONObjectWithData(self, _cmd, data, opt, error);
-    if (result) {
+
+    // Only patch if raw data contains "premium" — skip all other JSON (ads, analytics, etc.)
+    if (result && dataContainsPremiumKey(data)) {
         @try {
-            // Only patch if it looks like AppRaven data
-            if (isAppRavenGraphQLResponse(result)) {
-                result = patchPremiumInJSON(result);
+            BOOL didPatch = NO;
+            id patched = patchPremiumInJSON(result, &didPatch);
+            if (didPatch) {
+                PMLOG(@"⚡ Patched premium fields in JSON response (%lu bytes)", (unsigned long)data.length);
+                return patched;
             }
         } @catch (NSException *e) {
-            // Never crash — return original result
+            // Never crash — return original
         }
     }
     return result;
 }
 
-/// Hook NSJSONSerialization — targeted to only patch AppRaven responses.
 static void hookJSONSerialization(void) {
     Class jsonClass = objc_getClass("NSJSONSerialization");
     if (!jsonClass) return;
@@ -346,57 +305,219 @@ static void hookJSONSerialization(void) {
     if (method) {
         orig_JSONObjectWithData = (typeof(orig_JSONObjectWithData))method_getImplementation(method);
         method_setImplementation(method, (IMP)hook_JSONObjectWithData);
-        PMLOG(@"✅ Hooked NSJSONSerialization (targeted GraphQL patching)");
+        PMLOG(@"✅ Hooked NSJSONSerialization (byte pre-check + full patch)");
     }
 }
 
 // ═══════════════════════════════════════════════════════════════
-#pragma mark - Apollo Cache Intercept
+#pragma mark - NSURLProtocol — Intercept HTTP Response Bodies
 // ═══════════════════════════════════════════════════════════════
 
-static void hookApolloCachePremiumField(void) {
-    PMLOG(@"✅ Apollo cache premium field override active (via JSON + property hooks)");
+/// Custom NSURLProtocol that intercepts responses containing "premium"
+/// and patches the body before delivering to the caller (Apollo, etc.)
+@interface PremiumPatchURLProtocol : NSURLProtocol <NSURLSessionDataDelegate>
+@property (nonatomic, strong) NSURLSessionDataTask *dataTask;
+@property (nonatomic, strong) NSMutableData *receivedData;
+@property (nonatomic, strong) NSURLResponse *receivedResponse;
+@end
+
+static NSURLSession *g_protocolSession = nil;
+
+@implementation PremiumPatchURLProtocol
+
++ (BOOL)canInitWithRequest:(NSURLRequest *)request {
+    // Don't re-process our own requests
+    if ([NSURLProtocol propertyForKey:@"PremiumMockHandled" inRequest:request]) {
+        return NO;
+    }
+    // Only intercept requests that might return premium data
+    // Target: AppRaven's GraphQL API endpoint
+    NSString *url = request.URL.absoluteString;
+    if (!url) return NO;
+
+    // Intercept GraphQL requests (typically POST to /graphql)
+    if ([request.HTTPMethod isEqualToString:@"POST"]) {
+        // Check if request body or URL contains graphql hints
+        if ([url containsString:@"graphql"] ||
+            [url containsString:@"appraven"] ||
+            [url containsString:@"api"]) {
+            return YES;
+        }
+        // Check Content-Type for JSON
+        NSString *contentType = [request valueForHTTPHeaderField:@"Content-Type"];
+        if ([contentType containsString:@"json"]) {
+            // Check request body for premium/user queries
+            NSData *body = request.HTTPBody;
+            if (body && dataContainsPremiumKey(body)) {
+                return YES;
+            }
+            // Also check for MyUserData query
+            if (body) {
+                NSString *bodyStr = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
+                if (bodyStr && ([bodyStr containsString:@"MyUserData"] ||
+                                [bodyStr containsString:@"premium"] ||
+                                [bodyStr containsString:@"handleSubscription"])) {
+                    return YES;
+                }
+            }
+        }
+    }
+    return NO;
+}
+
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
+    return request;
+}
+
+- (void)startLoading {
+    NSMutableURLRequest *mutableReq = [self.request mutableCopy];
+    [NSURLProtocol setProperty:@YES forKey:@"PremiumMockHandled" inRequest:mutableReq];
+
+    self.receivedData = [NSMutableData new];
+
+    if (!g_protocolSession) {
+        NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
+        g_protocolSession = [NSURLSession sessionWithConfiguration:config
+                                                          delegate:self
+                                                     delegateQueue:nil];
+    }
+
+    self.dataTask = [g_protocolSession dataTaskWithRequest:mutableReq];
+    [self.dataTask resume];
+}
+
+- (void)stopLoading {
+    [self.dataTask cancel];
+    self.dataTask = nil;
+}
+
+#pragma mark NSURLSessionDataDelegate
+
+- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask
+    didReceiveResponse:(NSURLResponse *)response
+     completionHandler:(void (^)(NSURLSessionResponseDisposition))completionHandler {
+    self.receivedResponse = response;
+    completionHandler(NSURLSessionResponseAllow);
+}
+
+- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask
+    didReceiveData:(NSData *)data {
+    [self.receivedData appendData:data];
+}
+
+- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task
+    didCompleteWithError:(NSError *)error {
+    if (error) {
+        [self.client URLProtocol:self didFailWithError:error];
+        return;
+    }
+
+    NSData *finalData = self.receivedData;
+
+    // Patch the response body if it contains premium
+    if (finalData && dataContainsPremiumKey(finalData)) {
+        @try {
+            NSError *jsonError = nil;
+            id json = [NSJSONSerialization JSONObjectWithData:finalData
+                                                     options:0
+                                                       error:&jsonError];
+            if (json && !jsonError) {
+                BOOL didPatch = NO;
+                id patched = patchPremiumInJSON(json, &didPatch);
+                if (didPatch) {
+                    NSData *patchedData = [NSJSONSerialization dataWithJSONObject:patched
+                                                                         options:0
+                                                                           error:nil];
+                    if (patchedData) {
+                        finalData = patchedData;
+                        PMLOG(@"⚡ NSURLProtocol patched premium in response (%lu→%lu bytes)",
+                              (unsigned long)self.receivedData.length,
+                              (unsigned long)patchedData.length);
+                    }
+                }
+            }
+        } @catch (NSException *e) {
+            // Use original data
+        }
+    }
+
+    // Deliver (potentially patched) response to caller
+    [self.client URLProtocol:self didReceiveResponse:self.receivedResponse
+            cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+    [self.client URLProtocol:self didLoadData:finalData];
+    [self.client URLProtocolDidFinishLoading:self];
+}
+
+@end
+
+// ═══════════════════════════════════════════════════════════════
+#pragma mark - Hook URLSessionConfiguration to inject our protocol
+// ═══════════════════════════════════════════════════════════════
+
+static IMP orig_defaultSessionConfig = NULL;
+static IMP orig_ephemeralSessionConfig = NULL;
+
+/// Inject PremiumPatchURLProtocol into session configuration's protocolClasses
+static void injectProtocolIntoConfig(NSURLSessionConfiguration *config) {
+    if (!config) return;
+    NSMutableArray *protocols = [NSMutableArray arrayWithArray:config.protocolClasses ?: @[]];
+    if (![protocols containsObject:[PremiumPatchURLProtocol class]]) {
+        [protocols insertObject:[PremiumPatchURLProtocol class] atIndex:0];
+        config.protocolClasses = protocols;
+    }
+}
+
+static NSURLSessionConfiguration* hook_defaultSessionConfig(id self, SEL _cmd) {
+    NSURLSessionConfiguration *config = ((NSURLSessionConfiguration*(*)(id,SEL))orig_defaultSessionConfig)(self, _cmd);
+    injectProtocolIntoConfig(config);
+    return config;
+}
+
+static NSURLSessionConfiguration* hook_ephemeralSessionConfig(id self, SEL _cmd) {
+    NSURLSessionConfiguration *config = ((NSURLSessionConfiguration*(*)(id,SEL))orig_ephemeralSessionConfig)(self, _cmd);
+    injectProtocolIntoConfig(config);
+    return config;
+}
+
+static void hookURLSessionConfiguration(void) {
+    Class cls = [NSURLSessionConfiguration class];
+
+    // Hook +defaultSessionConfiguration
+    Method m1 = class_getClassMethod(cls, @selector(defaultSessionConfiguration));
+    if (m1) {
+        orig_defaultSessionConfig = method_getImplementation(m1);
+        method_setImplementation(m1, (IMP)hook_defaultSessionConfig);
+    }
+
+    // Hook +ephemeralSessionConfiguration
+    Method m2 = class_getClassMethod(cls, @selector(ephemeralSessionConfiguration));
+    if (m2) {
+        orig_ephemeralSessionConfig = method_getImplementation(m2);
+        method_setImplementation(m2, (IMP)hook_ephemeralSessionConfig);
+    }
+
+    // Also register globally for shared session
+    [NSURLProtocol registerClass:[PremiumPatchURLProtocol class]];
+
+    PMLOG(@"✅ NSURLProtocol registered + URLSessionConfiguration hooked");
 }
 
 // ═══════════════════════════════════════════════════════════════
-#pragma mark - Enumerate All Classes for Premium Properties
+#pragma mark - Class Scanning
 // ═══════════════════════════════════════════════════════════════
 
-/// Scan all AppRaven classes at runtime and hook any that have
-/// premium-related properties.
 static void hookAllPremiumProperties(void) {
     unsigned int classCount = 0;
     Class *classes = objc_copyClassList(&classCount);
     if (!classes) return;
 
-    int hookCount = 0;
     for (unsigned int i = 0; i < classCount; i++) {
-        @try {
-            Class cls = classes[i];
-            const char *name = class_getName(cls);
-            if (!name) continue;
-
-            // Only process AppRaven classes
-            if (strncmp(name, "_TtC8AppRaven", 13) != 0) continue;
-
-            hookPremiumPropsOnClass(cls);
-            hookCount++;
-        } @catch (NSException *e) {
-            // Skip problematic classes
-        }
+        @try { hookPremiumPropsOnClass(classes[i]); } @catch (NSException *e) {}
     }
-
     free(classes);
-    PMLOG(@"✅ Scanned %d AppRaven classes", hookCount);
 }
 
-// ═══════════════════════════════════════════════════════════════
-#pragma mark - Targeted Hooks (Known Classes)
-// ═══════════════════════════════════════════════════════════════
-
-/// Hook specifically known classes/selectors found in binary analysis.
 static void hookKnownTargets(void) {
-
     const char *knownClasses[] = {
         APPRAVEN_PREMIUM_VM, APPRAVEN_MAIN_TVM, APPRAVEN_ACCOUNT_VM,
         APPRAVEN_LOGIN_VM, APPRAVEN_NETWORK, APPRAVEN_HOME_VM,
@@ -404,15 +525,12 @@ static void hookKnownTargets(void) {
         APPRAVEN_SUBSCRIPTION, APPRAVEN_SUBSCRIPTION_VM,
         APPRAVEN_STORE_VM, NULL
     };
-
     for (int i = 0; knownClasses[i]; i++) {
         Class cls = objc_getClass(knownClasses[i]);
-        if (cls) {
-            hookPremiumPropsOnClass(cls);
-        }
+        if (cls) hookPremiumPropsOnClass(cls);
     }
 
-    // ── Extra: explicit hooks for critical paths ──
+    // Explicit critical hooks
     hookBoolGetter(APPRAVEN_PREMIUM_VM, SEL_PREMIUM, YES);
     hookBoolGetter(APPRAVEN_PREMIUM_VM, SEL_IS_PREMIUM, YES);
     hookBoolGetter(APPRAVEN_PREMIUM_VM, SEL_HAS_APPLE_PREMIUM, YES);
@@ -434,29 +552,19 @@ static void hookKnownTargets(void) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-#pragma mark - UserDefaults Persistence Intercept
+#pragma mark - UserDefaults Hook
 // ═══════════════════════════════════════════════════════════════
 
-/// Original IMP for NSUserDefaults boolForKey:
 static BOOL (*orig_boolForKey)(id, SEL, NSString*) = NULL;
-
-/// Premium keys set
 static NSSet *g_premiumDefaultsKeys = nil;
 
-/// Hooked boolForKey: — returns YES for premium keys only
 static BOOL hook_boolForKey(id self, SEL _cmd, NSString *key) {
-    if (g_premiumDefaultsKeys && [g_premiumDefaultsKeys containsObject:key]) {
-        return YES;
-    }
-    if (orig_boolForKey) {
-        return orig_boolForKey(self, _cmd, key);
-    }
-    return NO;
+    if (g_premiumDefaultsKeys && [g_premiumDefaultsKeys containsObject:key]) return YES;
+    return orig_boolForKey ? orig_boolForKey(self, _cmd, key) : NO;
 }
 
 static void hookUserDefaults(void) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-
     [defaults setBool:YES forKey:@"premium"];
     [defaults setBool:YES forKey:@"isPremium"];
     [defaults setBool:YES forKey:@"hasAppleIdPremium"];
@@ -470,132 +578,104 @@ static void hookUserDefaults(void) {
         @"PremiumPurchased", @"isSubscribed", @"pro"
     ]];
 
-    Method method = class_getInstanceMethod([NSUserDefaults class],
-                                            @selector(boolForKey:));
+    Method method = class_getInstanceMethod([NSUserDefaults class], @selector(boolForKey:));
     if (method) {
         orig_boolForKey = (typeof(orig_boolForKey))method_getImplementation(method);
         method_setImplementation(method, (IMP)hook_boolForKey);
-        PMLOG(@"✅ Hooked NSUserDefaults.boolForKey: for premium keys");
     }
 }
 
 // ═══════════════════════════════════════════════════════════════
-#pragma mark - Lifecycle Observer (App Foreground, etc.)
+#pragma mark - Lifecycle Observer
 // ═══════════════════════════════════════════════════════════════
 
 @interface PremiumLifecycleObserver : NSObject
 @end
 
 @implementation PremiumLifecycleObserver
-
 - (instancetype)init {
     self = [super init];
     if (self) {
         NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
-
-        // App lifecycle — these are the real UIKit notification names
         [nc addObserver:self selector:@selector(onReEnforce:)
                    name:@"UIApplicationWillEnterForegroundNotification" object:nil];
         [nc addObserver:self selector:@selector(onReEnforce:)
                    name:@"UIApplicationDidBecomeActiveNotification" object:nil];
-
-        PMLOG(@"✅ Lifecycle observer installed");
     }
     return self;
 }
-
 - (void)onReEnforce:(NSNotification *)note {
-    PMLOG(@"⚡ Re-enforcing hooks (%@)", note.name);
-    // Delay slightly to let the app finish its own updates first
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         [PremiumMockLoader reEnforceAllHooks];
     });
 }
-
-- (void)dealloc {
-    [[NSNotificationCenter defaultCenter] removeObserver:self];
-}
-
+- (void)dealloc { [[NSNotificationCenter defaultCenter] removeObserver:self]; }
 @end
 
 static PremiumLifecycleObserver *g_lifecycleObserver = nil;
 
 // ═══════════════════════════════════════════════════════════════
-#pragma mark - Periodic Re-Enforcement Timer
+#pragma mark - Periodic Timer
 // ═══════════════════════════════════════════════════════════════
 
 static dispatch_source_t g_timer = nil;
 
-/// Repeating timer that re-applies hooks every 15 seconds.
 static void installPeriodicReEnforcement(void) {
     g_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
                                      dispatch_get_main_queue());
     if (!g_timer) return;
-
-    // Fire every 15 seconds, with 5 seconds leeway for power efficiency
     dispatch_source_set_timer(g_timer,
                               dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC),
-                              15 * NSEC_PER_SEC,
-                              5 * NSEC_PER_SEC);
-
+                              15 * NSEC_PER_SEC, 5 * NSEC_PER_SEC);
     dispatch_source_set_event_handler(g_timer, ^{
         @autoreleasepool {
-            @try {
-                [PremiumMockLoader reEnforceAllHooks];
-            } @catch (NSException *e) {
-                PMLOG(@"⚠️  Timer re-enforce error: %@", e.reason);
-            }
+            @try { [PremiumMockLoader reEnforceAllHooks]; } @catch (NSException *e) {}
         }
     });
-
     dispatch_resume(g_timer);
-    PMLOG(@"✅ Periodic re-enforcement timer installed (every 15s)");
+    PMLOG(@"✅ Timer installed (15s)");
 }
 
 // ═══════════════════════════════════════════════════════════════
-#pragma mark - PremiumMockLoader Implementation
+#pragma mark - PremiumMockLoader
 // ═══════════════════════════════════════════════════════════════
 
 @implementation PremiumMockLoader
 
 + (void)activate {
-    PMLOG(@"🚀 Activating PremiumMock v2.1 for AppRaven QA testing...");
+    PMLOG(@"🚀 PremiumMock v2.2 activating...");
 
-    // 1. Hook known targets from binary analysis
+    // Layer 1: Property hooks (ObjC getter/setter swizzle)
     hookKnownTargets();
-
-    // 2. Scan all AppRaven classes
     hookAllPremiumProperties();
 
-    // 3. Set & hook UserDefaults
+    // Layer 2: UserDefaults
     hookUserDefaults();
 
-    // 4. Hook JSON parsing (targeted — only GraphQL responses)
+    // Layer 3: JSON response patching (NSJSONSerialization hook)
     hookJSONSerialization();
 
-    // 5. Apollo cache layer
-    hookApolloCachePremiumField();
+    // Layer 4: NSURLProtocol — intercept HTTP responses BEFORE any framework
+    hookURLSessionConfiguration();
 
-    // 6. KVO watchers for @Published properties
+    // Layer 5: KVO watchers
     installKVOWatchers();
 
-    // 7. Lifecycle observer (foreground)
+    // Layer 6: Lifecycle observer
     g_lifecycleObserver = [[PremiumLifecycleObserver alloc] init];
 
-    // 8. Periodic re-enforcement timer
+    // Layer 7: Periodic timer
     installPeriodicReEnforcement();
 
-    PMLOG(@"✅ PremiumMock v2.1 activation complete!");
-    PMLOG(@"────────────────────────────────────────");
-    PMLOG(@"  premium              = true");
-    PMLOG(@"  hasAppleIdPremium    = true");
-    PMLOG(@"  premiumOnly          = false (unlocked)");
-    PMLOG(@"  showsPremiumV        = false (suppressed)");
-    PMLOG(@"  JSON patch           = targeted GraphQL only");
-    PMLOG(@"  Periodic re-enforce  = every 15s");
-    PMLOG(@"  Lifecycle observer   = active");
-    PMLOG(@"────────────────────────────────────────");
+    PMLOG(@"✅ PremiumMock v2.2 active!");
+    PMLOG(@"  Layer 1: Property hooks ✅");
+    PMLOG(@"  Layer 2: UserDefaults ✅");
+    PMLOG(@"  Layer 3: JSON patch ✅");
+    PMLOG(@"  Layer 4: NSURLProtocol ✅");
+    PMLOG(@"  Layer 5: KVO watchers ✅");
+    PMLOG(@"  Layer 6: Lifecycle ✅");
+    PMLOG(@"  Layer 7: Timer (15s) ✅");
 }
 
 + (void)reEnforceAllHooks {
@@ -603,48 +683,43 @@ static void installPeriodicReEnforcement(void) {
         hookKnownTargets();
         hookAllPremiumProperties();
 
-        NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-        [defaults setBool:YES forKey:@"premium"];
-        [defaults setBool:YES forKey:@"isPremium"];
-        [defaults setBool:YES forKey:@"hasAppleIdPremium"];
-        [defaults setBool:YES forKey:@"PremiumPurchased"];
-        [defaults setBool:YES forKey:@"isSubscribed"];
-        [defaults setBool:YES forKey:@"pro"];
-        [defaults synchronize];
+        NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+        [d setBool:YES forKey:@"premium"];
+        [d setBool:YES forKey:@"isPremium"];
+        [d setBool:YES forKey:@"hasAppleIdPremium"];
+        [d setBool:YES forKey:@"PremiumPurchased"];
+        [d setBool:YES forKey:@"isSubscribed"];
+        [d setBool:YES forKey:@"pro"];
+        [d synchronize];
 
         installKVOWatchers();
-    } @catch (NSException *e) {
-        PMLOG(@"⚠️  reEnforceAllHooks error: %@", e.reason);
-    }
+    } @catch (NSException *e) {}
 }
 
 @end
 
 // ═══════════════════════════════════════════════════════════════
-#pragma mark - Constructor (Auto-load on dylib injection)
+#pragma mark - Constructor
 // ═══════════════════════════════════════════════════════════════
 
 __attribute__((constructor))
 static void premiumMockInit(void) {
     @autoreleasepool {
         PMLOG(@"═══════════════════════════════════════════");
-        PMLOG(@"  AppRaven PremiumMock v2.1 — QA Testing   ");
-        PMLOG(@"  NOT FOR PRODUCTION USE OR DISTRIBUTION   ");
+        PMLOG(@"  AppRaven PremiumMock v2.2 — QA Testing   ");
         PMLOG(@"═══════════════════════════════════════════");
 
-        // Delayed activation to ensure Swift classes are registered
+        // Activate after Swift metadata loaded
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             [PremiumMockLoader activate];
         });
 
-        // Second sweep after app is more fully loaded
+        // Late sweep
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            PMLOG(@"🔄 Late sweep for newly loaded classes...");
+            PMLOG(@"🔄 Late sweep...");
             [PremiumMockLoader reEnforceAllHooks];
         });
-
-        PMLOG(@"✅ Dylib loaded — activation scheduled");
     }
 }
