@@ -1,15 +1,19 @@
-name: Build iOS Dylib
+name: Build and Release iOS Dylib
 
 on:
   push:
     branches: [ "main", "master" ]
+    tags: [ "v*" ]
   pull_request:
     branches: [ "main", "master" ]
-  workflow_dispatch: # Cho phép nhấn nút "Run workflow" thủ công trên giao diện GitHub
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
-    runs-on: macos-14 # Chạy trên macOS Apple Silicon (M1/M2) có sẵn Xcode và iOS SDK
+    runs-on: macos-14
 
     steps:
       - name: Checkout Source
@@ -40,8 +44,34 @@ jobs:
           codesign --force --sign - --entitlements entitlements.plist AppRavenPremiumMock.dylib
           file AppRavenPremiumMock.dylib
 
+      - name: Compress Dylib
+        run: |
+          zip -9 AppRavenPremiumMock.zip AppRavenPremiumMock.dylib
+
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: AppRavenPremiumMock-dylib
           path: AppRavenPremiumMock.dylib
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v1.0.0' }}
+          name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'AppRaven Premium Mock v1.0.0' }}
+          body: |
+            ## 🚀 AppRaven Premium Mock Dylib
+
+            ### 📦 Tải xuống (Direct Download):
+            - **AppRavenPremiumMock.dylib**: Thư viện dylib (arm64, ad-hoc signed) dùng inject vào IPA AppRaven.
+            - **AppRavenPremiumMock.zip**: Bản nén zip của file dylib.
+
+            ### 🛠️ Cách tích hợp:
+            1. Tải `AppRavenPremiumMock.dylib` về máy.
+            2. Sử dụng Sideloadly / Scarlet / TrollStore hoặc script `inject.sh` để inject dylib vào file IPA AppRaven.
+          files: |
+            AppRavenPremiumMock.dylib
+            AppRavenPremiumMock.zip
+          draft: false
+          prerelease: false

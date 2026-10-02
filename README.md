@@ -1,5 +1,11 @@
 # AppRavenPremiumMock — QA Testing Dylib
 
+[![Build & Release](https://github.com/tn2am/appraven-dylib/actions/workflows/build.yml/badge.svg)](https://github.com/tn2am/appraven-dylib/actions/workflows/build.yml)
+[![GitHub Release](https://img.shields.io/github/v/release/tn2am/appraven-dylib)](https://github.com/tn2am/appraven-dylib/releases/latest)
+
+> 📥 **Tải nhanh dylib đã build sẵn:**  
+> Truy cập [**Releases**](https://github.com/tn2am/appraven-dylib/releases/latest) để tải ngay `AppRavenPremiumMock.dylib` hoặc `AppRavenPremiumMock.zip`.
+
 A dynamic library for **lab/QA testing** that hooks into AppRaven's runtime to simulate `premium = true` state without requiring a real subscription or external services.
 
 ## Project Structure
