@@ -1,0 +1,12 @@
+# Build artifacts
+*.dylib
+*.ipa
+*.o
+build/
+DerivedData/
+
+# Operating System files
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db

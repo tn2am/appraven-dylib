@@ -1,0 +1,47 @@
+name: Build iOS Dylib
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch: # Cho phép nhấn nút "Run workflow" thủ công trên giao diện GitHub
+
+jobs:
+  build:
+    runs-on: macos-14 # Chạy trên macOS Apple Silicon (M1/M2) có sẵn Xcode và iOS SDK
+
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+
+      - name: Show Xcode & SDK Info
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Compile Dylib
+        run: |
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          clang -arch arm64 \
+                -isysroot "$SDK_PATH" \
+                -miphoneos-version-min=15.0 \
+                -dynamiclib \
+                -fobjc-arc \
+                -Wall -O2 \
+                -framework Foundation \
+                -framework UIKit \
+                -lobjc \
+                -o AppRavenPremiumMock.dylib \
+                PremiumMock.m
+
+      - name: Ad-hoc Codesign
+        run: |
+          codesign --force --sign - --entitlements entitlements.plist AppRavenPremiumMock.dylib
+          file AppRavenPremiumMock.dylib
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AppRavenPremiumMock-dylib
+          path: AppRavenPremiumMock.dylib
