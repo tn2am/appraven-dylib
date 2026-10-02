@@ -689,60 +689,34 @@ static void hookStoreKit(void) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-#pragma mark - Dyld Image Monitor
-// ═══════════════════════════════════════════════════════════════
-
-static void image_added(const struct mach_header *mh, intptr_t vmaddr_slide) {
-    // Throttle the calls because at app launch, this is called ~500 times synchronously.
-    // Overloading the main queue with 500 hookKnownTargets() calls causes the app to spin indefinitely.
-    static BOOL isThrottled = NO;
-    
-    @synchronized ([PremiumMockLoader class]) {
-        if (isThrottled) return;
-        isThrottled = YES;
-    }
-    
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        @synchronized ([PremiumMockLoader class]) {
-            isThrottled = NO;
-        }
-        hookKnownTargets();
-    });
-}
-
-static void installDyldMonitor(void) {
-    _dyld_register_func_for_add_image(image_added);
-    PMLOG(@"✅ Installed dyld image add monitor");
-}
-
-// ═══════════════════════════════════════════════════════════════
 #pragma mark - PremiumMockLoader
 // ═══════════════════════════════════════════════════════════════
 
 @implementation PremiumMockLoader
 
 + (void)earlyActivate {
-    PMLOG(@"🚀 PremiumMock v3.0.2 early phase...");
-    // Must run immediately to catch App launch initialization
+    PMLOG(@"🚀 PremiumMock v3.0.3 early phase...");
+    // NSJSONSerialization is 100% safe to hook instantly and catches 99% of Apollo traffic
     hookJSONSerialization();
-    hookURLSessionConfiguration();
     hookStoreKit();
     hookUserDefaults();
     PMLOG(@"✅ Early Foundation hooks active!");
 }
 
 + (void)activate {
-    PMLOG(@"🚀 PremiumMock v3.0.2 delayed phase...");
+    PMLOG(@"🚀 PremiumMock v3.0.3 delayed phase...");
 
     hookKnownTargets();
     hookAllPremiumProperties();
     installKVOWatchers();
     
+    // NSURLProtocol delayed to avoid blocking critical startup auth/config APIs
+    hookURLSessionConfiguration();
+    
     g_lifecycleObserver = [[PremiumLifecycleObserver alloc] init];
     installPeriodicReEnforcement();
-    installDyldMonitor();
 
-    PMLOG(@"✅ PremiumMock v3.0.2 active!");
+    PMLOG(@"✅ PremiumMock v3.0.3 active!");
 }
 
 + (void)reEnforceAllHooks {
@@ -773,7 +747,7 @@ __attribute__((constructor))
 static void premiumMockInit(void) {
     @autoreleasepool {
         PMLOG(@"═══════════════════════════════════════════");
-        PMLOG(@"  AppRaven PremiumMock v3.0.2 — QA Testing   ");
+        PMLOG(@"  AppRaven PremiumMock v3.0.3 — QA Testing   ");
         PMLOG(@"═══════════════════════════════════════════");
 
         // 1. Hook foundational classes immediately to beat Apollo/Network init
