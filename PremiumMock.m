@@ -17,6 +17,8 @@
 #import "PremiumMock.h"
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <mach-o/dyld.h>
+#import <StoreKit/StoreKit.h>
 
 // ═══════════════════════════════════════════════════════════════
 #pragma mark - Forward Declarations
@@ -638,13 +640,79 @@ static void installPeriodicReEnforcement(void) {
 }
 
 // ═══════════════════════════════════════════════════════════════
+#pragma mark - StoreKit Bypass (IAP Mock)
+// ═══════════════════════════════════════════════════════════════
+
+// Mock a successful SKPaymentTransaction
+@interface MockPaymentTransaction : NSObject
+@property (nonatomic, strong) SKPayment *payment;
+@property (nonatomic, assign) SKPaymentTransactionState transactionState;
+@property (nonatomic, strong) NSString *transactionIdentifier;
+@property (nonatomic, strong) NSDate *transactionDate;
+@property (nonatomic, strong) NSData *transactionReceipt;
+@end
+
+@implementation MockPaymentTransaction
+@end
+
+static void hook_addPayment(id self, SEL _cmd, SKPayment *payment) {
+    PMLOG(@"💎 Intercepted SKPaymentQueue addPayment: %@", payment.productIdentifier);
+    
+    // Create a fake successful transaction
+    MockPaymentTransaction *mockTx = [[MockPaymentTransaction alloc] init];
+    mockTx.payment = payment;
+    mockTx.transactionState = SKPaymentTransactionStatePurchased;
+    mockTx.transactionIdentifier = [[NSUUID UUID] UUIDString];
+    mockTx.transactionDate = [NSDate date];
+    
+    // Deliver it to all observers
+    NSArray *observers = [self valueForKey:@"_observers"];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        for (id observer in observers) {
+            if ([observer respondsToSelector:@selector(paymentQueue:updatedTransactions:)]) {
+                [observer paymentQueue:self updatedTransactions:@[mockTx]];
+                PMLOG(@"💎 Sent fake success transaction to observer: %@", observer);
+            }
+        }
+    });
+}
+
+static void hookStoreKit(void) {
+    Class queueCls = objc_getClass("SKPaymentQueue");
+    if (queueCls) {
+        Method m = class_getInstanceMethod(queueCls, @selector(addPayment:));
+        if (m) {
+            method_setImplementation(m, (IMP)hook_addPayment);
+            PMLOG(@"✅ Hooked SKPaymentQueue addPayment:");
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+#pragma mark - Dyld Image Monitor
+// ═══════════════════════════════════════════════════════════════
+
+static void image_added(const struct mach_header *mh, intptr_t vmaddr_slide) {
+    // When a new binary/framework is loaded, check if we need to re-apply hooks
+    // This catches lazy-loaded Swift libraries or views.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        hookKnownTargets();
+    });
+}
+
+static void installDyldMonitor(void) {
+    _dyld_register_func_for_add_image(image_added);
+    PMLOG(@"✅ Installed dyld image add monitor");
+}
+
+// ═══════════════════════════════════════════════════════════════
 #pragma mark - PremiumMockLoader
 // ═══════════════════════════════════════════════════════════════
 
 @implementation PremiumMockLoader
 
 + (void)activate {
-    PMLOG(@"🚀 PremiumMock v2.2 activating...");
+    PMLOG(@"🚀 PremiumMock v3.0 activating...");
 
     // Layer 1: Property hooks (ObjC getter/setter swizzle)
     hookKnownTargets();
@@ -662,20 +730,28 @@ static void installPeriodicReEnforcement(void) {
     // Layer 5: KVO watchers
     installKVOWatchers();
 
-    // Layer 6: Lifecycle observer
+    // Layer 6: StoreKit fake purchase success
+    hookStoreKit();
+
+    // Layer 7: Lifecycle observer
     g_lifecycleObserver = [[PremiumLifecycleObserver alloc] init];
 
-    // Layer 7: Periodic timer
+    // Layer 8: Periodic timer
     installPeriodicReEnforcement();
 
-    PMLOG(@"✅ PremiumMock v2.2 active!");
+    // Layer 9: Dyld monitor
+    installDyldMonitor();
+
+    PMLOG(@"✅ PremiumMock v3.0 active!");
     PMLOG(@"  Layer 1: Property hooks ✅");
     PMLOG(@"  Layer 2: UserDefaults ✅");
     PMLOG(@"  Layer 3: JSON patch ✅");
     PMLOG(@"  Layer 4: NSURLProtocol ✅");
     PMLOG(@"  Layer 5: KVO watchers ✅");
-    PMLOG(@"  Layer 6: Lifecycle ✅");
-    PMLOG(@"  Layer 7: Timer (15s) ✅");
+    PMLOG(@"  Layer 6: StoreKit (IAP) ✅");
+    PMLOG(@"  Layer 7: Lifecycle ✅");
+    PMLOG(@"  Layer 8: Timer (15s) ✅");
+    PMLOG(@"  Layer 9: Dyld monitor ✅");
 }
 
 + (void)reEnforceAllHooks {
@@ -706,7 +782,7 @@ __attribute__((constructor))
 static void premiumMockInit(void) {
     @autoreleasepool {
         PMLOG(@"═══════════════════════════════════════════");
-        PMLOG(@"  AppRaven PremiumMock v2.2 — QA Testing   ");
+        PMLOG(@"  AppRaven PremiumMock v3.0 — QA Testing   ");
         PMLOG(@"═══════════════════════════════════════════");
 
         // Activate after Swift metadata loaded

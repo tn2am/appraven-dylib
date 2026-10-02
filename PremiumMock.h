@@ -5,9 +5,11 @@
 //  QA Testing Dylib — Simulates premium = true for lab testing.
 //  NOT for production use or distribution.
 //
-//  v2.0 — Comprehensive hooks including GraphQL response interception,
-//         class load monitoring, periodic re-enforcement, and
-//         NSNotificationCenter observation.
+//  v3.0 — Added StoreKit (In-App Purchase) fake success mock and
+//         dyld image load monitor for lazy-loaded Swift classes.
+//
+//  v2.2 — Comprehensive hooks including GraphQL response interception,
+//         periodic re-enforcement, and NSNotificationCenter observation.
 //
 
 #ifndef PremiumMock_h

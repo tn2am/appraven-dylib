@@ -1,4 +1,4 @@
-# AppRavenPremiumMock v2.0 — QA Testing Dylib
+# AppRavenPremiumMock v3.0 — QA Testing Dylib
 
 [![Build & Release](https://github.com/tn2am/appraven-dylib/actions/workflows/build.yml/badge.svg)](https://github.com/tn2am/appraven-dylib/actions/workflows/build.yml)
 [![GitHub Release](https://img.shields.io/github/v/release/tn2am/appraven-dylib)](https://github.com/tn2am/appraven-dylib/releases/latest)
@@ -8,21 +8,22 @@
 
 A dynamic library for **lab/QA testing** that hooks into AppRaven's runtime to simulate `premium = true` state without requiring a real subscription or external services.
 
-## What's New in v2.0
+## What's New in v3.0
 
-> ⚡ **Fixes the issue where premium disappears after a while.**
+> ⚡ **Added StoreKit bypass and implemented Dyld image monitor**
 
-| Layer | v1.0 | v2.0 |
+| Layer | v2.2 | v3.0 |
 |-------|------|------|
-| Property swizzle | ✅ | ✅ Enhanced (more selectors) |
-| Setter blocking | ✅ | ✅ Enhanced (all setters) |
-| KVO watchers | ⚠️ Weak refs | ✅ Strong refs + lifecycle |
-| **JSON/GraphQL intercept** | ❌ | ✅ `NSJSONSerialization` hook |
+| Property swizzle | ✅ | ✅ Enhanced |
+| Setter blocking | ✅ | ✅ Enhanced |
+| KVO watchers | ✅ | ✅ Strong refs + lifecycle |
+| **JSON/GraphQL intercept** | ✅ | ✅ `NSJSONSerialization` & `NSURLProtocol` |
+| **StoreKit (IAP) Bypass** | ❌ | ✅ `SKPaymentQueue addPayment:` mock |
 | **Class load monitor** | ❌ | ✅ `_dyld_register_func_for_add_image` |
-| **Periodic re-enforce** | ❌ | ✅ Every 10 seconds |
-| **Lifecycle observer** | ❌ | ✅ Foreground, login, refresh |
-| **UserDefaults hook** | ⚠️ Write only | ✅ Read hook (`boolForKey:`) |
-| **Multi-phase init** | ⚠️ Single delay | ✅ 4-phase (0s, 0.5s, 3s, 8s) |
+| **Periodic re-enforce** | ✅ | ✅ Every 15 seconds |
+| **Lifecycle observer** | ✅ | ✅ Foreground, login, refresh |
+| **UserDefaults hook** | ✅ | ✅ Read hook (`boolForKey:`) |
+| **Multi-phase init** | ✅ | ✅ Init + late sweep |
 
 ### Why premium was being lost
 
@@ -100,18 +101,23 @@ After installing the test build, check Console/log output for:
 
 ```
 [PremiumMock] ═══════════════════════════════════════════
-[PremiumMock]   AppRaven PremiumMock v2.0 — QA Testing   
+[PremiumMock]   AppRaven PremiumMock v3.0 — QA Testing   
 [PremiumMock] ═══════════════════════════════════════════
-[PremiumMock] ✅ Phase 1 complete (immediate hooks applied)
-[PremiumMock] ✅ Hooked NSJSONSerialization.JSONObjectWithData → premium fields patched
-[PremiumMock] ✅ PremiumMock v2.0 activation complete!
-[PremiumMock]   premium              = true
-[PremiumMock]   hasAppleIdPremium    = true
-[PremiumMock]   premiumOnly          = false (unlocked)
-[PremiumMock]   JSON response patch  = active
-[PremiumMock]   Class load monitor   = active
-[PremiumMock]   Periodic re-enforce  = every 10s
-[PremiumMock]   Lifecycle observer   = active
+[PremiumMock] 🚀 PremiumMock v3.0 activating...
+[PremiumMock] ✅ Hooked NSJSONSerialization (byte pre-check + full patch)
+[PremiumMock] ✅ NSURLProtocol registered + URLSessionConfiguration hooked
+[PremiumMock] ✅ Hooked SKPaymentQueue addPayment:
+[PremiumMock] ✅ Installed dyld image add monitor
+[PremiumMock] ✅ PremiumMock v3.0 active!
+[PremiumMock]   Layer 1: Property hooks ✅
+[PremiumMock]   Layer 2: UserDefaults ✅
+[PremiumMock]   Layer 3: JSON patch ✅
+[PremiumMock]   Layer 4: NSURLProtocol ✅
+[PremiumMock]   Layer 5: KVO watchers ✅
+[PremiumMock]   Layer 6: StoreKit (IAP) ✅
+[PremiumMock]   Layer 7: Lifecycle ✅
+[PremiumMock]   Layer 8: Timer (15s) ✅
+[PremiumMock]   Layer 9: Dyld monitor ✅
 ```
 
 You can also verify via lldb:
