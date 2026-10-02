@@ -721,47 +721,28 @@ static void installDyldMonitor(void) {
 
 @implementation PremiumMockLoader
 
-+ (void)activate {
-    PMLOG(@"🚀 PremiumMock v3.0.1 activating...");
++ (void)earlyActivate {
+    PMLOG(@"🚀 PremiumMock v3.0.2 early phase...");
+    // Must run immediately to catch App launch initialization
+    hookJSONSerialization();
+    hookURLSessionConfiguration();
+    hookStoreKit();
+    hookUserDefaults();
+    PMLOG(@"✅ Early Foundation hooks active!");
+}
 
-    // Layer 1: Property hooks (ObjC getter/setter swizzle)
++ (void)activate {
+    PMLOG(@"🚀 PremiumMock v3.0.2 delayed phase...");
+
     hookKnownTargets();
     hookAllPremiumProperties();
-
-    // Layer 2: UserDefaults
-    hookUserDefaults();
-
-    // Layer 3: JSON response patching (NSJSONSerialization hook)
-    hookJSONSerialization();
-
-    // Layer 4: NSURLProtocol — intercept HTTP responses BEFORE any framework
-    hookURLSessionConfiguration();
-
-    // Layer 5: KVO watchers
     installKVOWatchers();
-
-    // Layer 6: StoreKit fake purchase success
-    hookStoreKit();
-
-    // Layer 7: Lifecycle observer
+    
     g_lifecycleObserver = [[PremiumLifecycleObserver alloc] init];
-
-    // Layer 8: Periodic timer
     installPeriodicReEnforcement();
-
-    // Layer 9: Dyld monitor
     installDyldMonitor();
 
-    PMLOG(@"✅ PremiumMock v3.0.1 active!");
-    PMLOG(@"  Layer 1: Property hooks ✅");
-    PMLOG(@"  Layer 2: UserDefaults ✅");
-    PMLOG(@"  Layer 3: JSON patch ✅");
-    PMLOG(@"  Layer 4: NSURLProtocol ✅");
-    PMLOG(@"  Layer 5: KVO watchers ✅");
-    PMLOG(@"  Layer 6: StoreKit (IAP) ✅");
-    PMLOG(@"  Layer 7: Lifecycle ✅");
-    PMLOG(@"  Layer 8: Timer (15s) ✅");
-    PMLOG(@"  Layer 9: Dyld monitor ✅");
+    PMLOG(@"✅ PremiumMock v3.0.2 active!");
 }
 
 + (void)reEnforceAllHooks {
@@ -792,16 +773,19 @@ __attribute__((constructor))
 static void premiumMockInit(void) {
     @autoreleasepool {
         PMLOG(@"═══════════════════════════════════════════");
-        PMLOG(@"  AppRaven PremiumMock v3.0.1 — QA Testing   ");
+        PMLOG(@"  AppRaven PremiumMock v3.0.2 — QA Testing   ");
         PMLOG(@"═══════════════════════════════════════════");
 
-        // Activate after Swift metadata loaded
+        // 1. Hook foundational classes immediately to beat Apollo/Network init
+        [PremiumMockLoader earlyActivate];
+
+        // 2. Hook Swift classes after metadata loaded
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             [PremiumMockLoader activate];
         });
 
-        // Late sweep
+        // 3. Late sweep
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             PMLOG(@"🔄 Late sweep...");
