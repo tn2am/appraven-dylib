@@ -311,198 +311,8 @@ static void hookJSONSerialization(void) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════
-#pragma mark - NSURLProtocol — Intercept HTTP Response Bodies
-// ═══════════════════════════════════════════════════════════════
-
-/// Custom NSURLProtocol that intercepts responses containing "premium"
-/// and patches the body before delivering to the caller (Apollo, etc.)
-@interface PremiumPatchURLProtocol : NSURLProtocol <NSURLSessionDataDelegate>
-@property (nonatomic, strong) NSURLSessionDataTask *dataTask;
-@property (nonatomic, strong) NSMutableData *receivedData;
-@property (nonatomic, strong) NSURLResponse *receivedResponse;
-@end
-
-static NSURLSession *g_protocolSession = nil;
-
-@implementation PremiumPatchURLProtocol
-
-+ (BOOL)canInitWithRequest:(NSURLRequest *)request {
-    // Don't re-process our own requests
-    if ([NSURLProtocol propertyForKey:@"PremiumMockHandled" inRequest:request]) {
-        return NO;
-    }
-    // Only intercept requests that might return premium data
-    // Target: AppRaven's GraphQL API endpoint
-    NSString *url = request.URL.absoluteString;
-    if (!url) return NO;
-
-    // Intercept GraphQL requests (typically POST to /graphql)
-    if ([request.HTTPMethod isEqualToString:@"POST"]) {
-        // Check if request body or URL contains graphql hints
-        if ([url containsString:@"graphql"] ||
-            [url containsString:@"appraven"] ||
-            [url containsString:@"api"]) {
-            return YES;
-        }
-        // Check Content-Type for JSON
-        NSString *contentType = [request valueForHTTPHeaderField:@"Content-Type"];
-        if ([contentType containsString:@"json"]) {
-            // Check request body for premium/user queries
-            NSData *body = request.HTTPBody;
-            if (body && dataContainsPremiumKey(body)) {
-                return YES;
-            }
-            // Also check for MyUserData query
-            if (body) {
-                NSString *bodyStr = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
-                if (bodyStr && ([bodyStr containsString:@"MyUserData"] ||
-                                [bodyStr containsString:@"premium"] ||
-                                [bodyStr containsString:@"handleSubscription"])) {
-                    return YES;
-                }
-            }
-        }
-    }
-    return NO;
-}
-
-+ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
-    return request;
-}
-
-- (void)startLoading {
-    NSMutableURLRequest *mutableReq = [self.request mutableCopy];
-    [NSURLProtocol setProperty:@YES forKey:@"PremiumMockHandled" inRequest:mutableReq];
-
-    self.receivedData = [NSMutableData new];
-
-    if (!g_protocolSession) {
-        NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
-        g_protocolSession = [NSURLSession sessionWithConfiguration:config
-                                                          delegate:self
-                                                     delegateQueue:nil];
-    }
-
-    self.dataTask = [g_protocolSession dataTaskWithRequest:mutableReq];
-    [self.dataTask resume];
-}
-
-- (void)stopLoading {
-    [self.dataTask cancel];
-    self.dataTask = nil;
-}
-
-#pragma mark NSURLSessionDataDelegate
-
-- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask
-    didReceiveResponse:(NSURLResponse *)response
-     completionHandler:(void (^)(NSURLSessionResponseDisposition))completionHandler {
-    self.receivedResponse = response;
-    completionHandler(NSURLSessionResponseAllow);
-}
-
-- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask
-    didReceiveData:(NSData *)data {
-    [self.receivedData appendData:data];
-}
-
-- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task
-    didCompleteWithError:(NSError *)error {
-    if (error) {
-        [self.client URLProtocol:self didFailWithError:error];
-        return;
-    }
-
-    NSData *finalData = self.receivedData;
-
-    // Patch the response body if it contains premium
-    if (finalData && dataContainsPremiumKey(finalData)) {
-        @try {
-            NSError *jsonError = nil;
-            id json = [NSJSONSerialization JSONObjectWithData:finalData
-                                                     options:0
-                                                       error:&jsonError];
-            if (json && !jsonError) {
-                BOOL didPatch = NO;
-                id patched = patchPremiumInJSON(json, &didPatch);
-                if (didPatch) {
-                    NSData *patchedData = [NSJSONSerialization dataWithJSONObject:patched
-                                                                         options:0
-                                                                           error:nil];
-                    if (patchedData) {
-                        finalData = patchedData;
-                        PMLOG(@"⚡ NSURLProtocol patched premium in response (%lu→%lu bytes)",
-                              (unsigned long)self.receivedData.length,
-                              (unsigned long)patchedData.length);
-                    }
-                }
-            }
-        } @catch (NSException *e) {
-            // Use original data
-        }
-    }
-
-    // Deliver (potentially patched) response to caller
-    [self.client URLProtocol:self didReceiveResponse:self.receivedResponse
-            cacheStoragePolicy:NSURLCacheStorageNotAllowed];
-    [self.client URLProtocol:self didLoadData:finalData];
-    [self.client URLProtocolDidFinishLoading:self];
-}
-
-@end
-
-// ═══════════════════════════════════════════════════════════════
-#pragma mark - Hook URLSessionConfiguration to inject our protocol
-// ═══════════════════════════════════════════════════════════════
-
-static IMP orig_defaultSessionConfig = NULL;
-static IMP orig_ephemeralSessionConfig = NULL;
-
-/// Inject PremiumPatchURLProtocol into session configuration's protocolClasses
-static void injectProtocolIntoConfig(NSURLSessionConfiguration *config) {
-    if (!config) return;
-    NSMutableArray *protocols = [NSMutableArray arrayWithArray:config.protocolClasses ?: @[]];
-    if (![protocols containsObject:[PremiumPatchURLProtocol class]]) {
-        [protocols insertObject:[PremiumPatchURLProtocol class] atIndex:0];
-        config.protocolClasses = protocols;
-    }
-}
-
-static NSURLSessionConfiguration* hook_defaultSessionConfig(id self, SEL _cmd) {
-    NSURLSessionConfiguration *config = ((NSURLSessionConfiguration*(*)(id,SEL))orig_defaultSessionConfig)(self, _cmd);
-    injectProtocolIntoConfig(config);
-    return config;
-}
-
-static NSURLSessionConfiguration* hook_ephemeralSessionConfig(id self, SEL _cmd) {
-    NSURLSessionConfiguration *config = ((NSURLSessionConfiguration*(*)(id,SEL))orig_ephemeralSessionConfig)(self, _cmd);
-    injectProtocolIntoConfig(config);
-    return config;
-}
-
-static void hookURLSessionConfiguration(void) {
-    Class cls = [NSURLSessionConfiguration class];
-
-    // Hook +defaultSessionConfiguration
-    Method m1 = class_getClassMethod(cls, @selector(defaultSessionConfiguration));
-    if (m1) {
-        orig_defaultSessionConfig = method_getImplementation(m1);
-        method_setImplementation(m1, (IMP)hook_defaultSessionConfig);
-    }
-
-    // Hook +ephemeralSessionConfiguration
-    Method m2 = class_getClassMethod(cls, @selector(ephemeralSessionConfiguration));
-    if (m2) {
-        orig_ephemeralSessionConfig = method_getImplementation(m2);
-        method_setImplementation(m2, (IMP)hook_ephemeralSessionConfig);
-    }
-
-    // Also register globally for shared session
-    [NSURLProtocol registerClass:[PremiumPatchURLProtocol class]];
-
-    PMLOG(@"✅ NSURLProtocol registered + URLSessionConfiguration hooked");
-}
+// URLProtocol is removed because it causes networking hangs for AppRaven's GraphQL API (like fetching IAP lists).
+// NSJSONSerialization hook is sufficient to patch premium fields in responses without breaking the HTTP streaming contract.
 
 // ═══════════════════════════════════════════════════════════════
 #pragma mark - Class Scanning
@@ -695,7 +505,7 @@ static void hookStoreKit(void) {
 @implementation PremiumMockLoader
 
 + (void)earlyActivate {
-    PMLOG(@"🚀 PremiumMock v3.0.3 early phase...");
+    PMLOG(@"🚀 PremiumMock v3.0.4 early phase...");
     // NSJSONSerialization is 100% safe to hook instantly and catches 99% of Apollo traffic
     hookJSONSerialization();
     hookStoreKit();
@@ -704,19 +514,16 @@ static void hookStoreKit(void) {
 }
 
 + (void)activate {
-    PMLOG(@"🚀 PremiumMock v3.0.3 delayed phase...");
+    PMLOG(@"🚀 PremiumMock v3.0.4 delayed phase...");
 
     hookKnownTargets();
     hookAllPremiumProperties();
     installKVOWatchers();
     
-    // NSURLProtocol delayed to avoid blocking critical startup auth/config APIs
-    hookURLSessionConfiguration();
-    
     g_lifecycleObserver = [[PremiumLifecycleObserver alloc] init];
     installPeriodicReEnforcement();
 
-    PMLOG(@"✅ PremiumMock v3.0.3 active!");
+    PMLOG(@"✅ PremiumMock v3.0.4 active!");
 }
 
 + (void)reEnforceAllHooks {
@@ -747,7 +554,7 @@ __attribute__((constructor))
 static void premiumMockInit(void) {
     @autoreleasepool {
         PMLOG(@"═══════════════════════════════════════════");
-        PMLOG(@"  AppRaven PremiumMock v3.0.3 — QA Testing   ");
+        PMLOG(@"  AppRaven PremiumMock v3.0.4 — QA Testing   ");
         PMLOG(@"═══════════════════════════════════════════");
 
         // 1. Hook foundational classes immediately to beat Apollo/Network init
